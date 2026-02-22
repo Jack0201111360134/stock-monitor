@@ -1,0 +1,44 @@
+# 依賴套件
+node_modules/
+*/node_modules/
+
+# 環境變數
+.env
+.env.local
+.env.*.local
+
+# 建置輸出
+dist/
+*/dist/
+build/
+
+# 資料庫
+*.db
+*.sqlite
+*.sqlite3
+server/data/
+
+# 日誌
+*.log
+npm-debug.log*
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 暫存檔
+*.tmp
+*.temp
+.cache/
+
+# 測試覆蓋率
+coverage/
+.nyc_output/
