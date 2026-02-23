@@ -406,6 +406,7 @@ export default function StockDetail({ stock }: StockDetailProps) {
   const [summary, setSummary] = useState<StockSummaryData | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(true);
 
@@ -454,16 +455,24 @@ export default function StockDetail({ stock }: StockDetailProps) {
 
   const handleRefresh = async () => {
     setRefreshing(true);
+    setRefreshError(null);
     try {
       // 同時刷新報價 + 圖表，確保兩邊數字一致
       const [quoteRes] = await Promise.all([
         quotesApi.getQuote(stock.symbol, stock.market),
         loadHistory(interval, INTERVAL_CONFIG[interval].defaultDays),
       ]);
-      setQuote(quoteRes.data);
-    } catch {}
-    finally {
+      if (quoteRes.data?.close > 0) {
+        setQuote(quoteRes.data);
+      } else {
+        setRefreshError('報價取得失敗，請稍後再試');
+      }
+    } catch {
+      setRefreshError('網路錯誤，無法刷新報價');
+    } finally {
       setRefreshing(false);
+      // 3 秒後自動清除錯誤提示
+      setTimeout(() => setRefreshError(null), 3000);
     }
   };
 
@@ -510,14 +519,19 @@ export default function StockDetail({ stock }: StockDetailProps) {
             </p>
           </div>
           <div className="text-right flex flex-col items-end gap-1.5">
-            <button
-              onClick={handleRefresh}
-              disabled={refreshing}
-              className="px-3 py-1 text-xs rounded disabled:opacity-50 transition-colors text-slate-400 hover:text-slate-200"
-              style={{ background: 'rgba(255,255,255,0.06)' }}
-            >
-              {refreshing ? '更新中...' : '🔄 刷新報價'}
-            </button>
+            <div className="flex items-center gap-2">
+              {refreshError && (
+                <span className="text-xs text-red-400 animate-pulse">{refreshError}</span>
+              )}
+              <button
+                onClick={handleRefresh}
+                disabled={refreshing}
+                className="px-3 py-1 text-xs rounded disabled:opacity-50 transition-colors text-slate-400 hover:text-slate-200"
+                style={{ background: 'rgba(255,255,255,0.06)' }}
+              >
+                {refreshing ? '更新中...' : '🔄 刷新報價'}
+              </button>
+            </div>
             {/* 大字體股價 + 呼吸燈 */}
             <div className="flex items-center gap-2">
               <span className="live-dot" />

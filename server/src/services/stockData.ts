@@ -7,42 +7,93 @@ const yahooHeaders = {
   'Accept': 'application/json',
 };
 
+// TWSE 即時行情 API 需帶 Referer，否則偶爾被擋或回傳空資料
+const twseMisHeaders = {
+  'User-Agent': yahooHeaders['User-Agent'],
+  'Referer': 'https://mis.twse.com.tw/',
+  'Accept': 'application/json, text/plain, */*',
+};
+
 /**
- * 取得台股即時報價 (使用證交所 API)
+ * 取得台股即時報價 (使用證交所 API + Yahoo Finance 備援)
  */
 async function getTWStockQuote(symbol: string): Promise<QuoteData | null> {
   try {
     // 先試上市 (TSE)，找不到再試上櫃 (OTC)——商品 ETF 有時掛牌在 OTC
+    // 加 _=timestamp 避免 CDN/Proxy 快取舊資料
     let data: any = null;
+    const cacheBust = `_=${Date.now()}`;
     for (const prefix of ['tse', 'otc']) {
-      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${prefix}_${symbol}.tw`;
-      const response = await axios.get(url, { timeout: 6000 });
+      const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${prefix}_${symbol}.tw&${cacheBust}`;
+      const response = await axios.get(url, { headers: twseMisHeaders, timeout: 8000 });
       if (response.data?.msgArray?.length) {
         data = response.data.msgArray[0];
         break;
       }
     }
-    if (!data) return null;
-
-    const lastPrice = parseFloat(data.z);
-    const prevClose = parseFloat(data.y) || 0;
-    // 非交易時間 z = "-"，fallback 昨收
-    const closePrice = (isFinite(lastPrice) && lastPrice > 0) ? lastPrice : prevClose;
 
     // 用 data.d（民國年格式 "115/02/07"）判斷是否非交易日
     // Taiwan time = UTC + 8h
     const taiwanNow = new Date(Date.now() + 8 * 3600 * 1000);
-    const todayTW = taiwanNow.toISOString().split('T')[0]; // "2026-02-22"
+    const todayTW = taiwanNow.toISOString().split('T')[0]; // "2026-02-23"
     let isMarketClosed = true;
-    if (data.d && typeof data.d === 'string' && data.d.includes('/')) {
+    if (data?.d && typeof data.d === 'string' && data.d.includes('/')) {
       const [rocY, m, d2] = data.d.split('/');
       const lastTradeDate = `${parseInt(rocY) + 1911}-${m.padStart(2,'0')}-${d2.padStart(2,'0')}`;
       isMarketClosed = lastTradeDate !== todayTW;
     }
 
+    const prevClose = parseFloat(data?.y) || 0;
+    const lastPrice = parseFloat(data?.z);
+    // TWSE z="-" 表示尚無成交，嘗試 Yahoo Finance 取得即時價
+    let closePrice = (isFinite(lastPrice) && lastPrice > 0) ? lastPrice : 0;
+
+    if (closePrice <= 0) {
+      // Yahoo Finance 備援：1m 線的最後一筆成交價
+      for (const suffix of ['.TW', '.TWO']) {
+        try {
+          const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}${suffix}?range=1d&interval=1m`;
+          const yRes = await axios.get(yUrl, { headers: yahooHeaders, timeout: 6000 });
+          const result = yRes.data?.chart?.result?.[0];
+          const meta = result?.meta;
+          const timestamps: number[] = result?.timestamp ?? [];
+          const minuteQuotes = result?.indicators?.quote?.[0];
+          let latestClose = 0;
+          for (let i = timestamps.length - 1; i >= 0; i--) {
+            const c = minuteQuotes?.close?.[i];
+            if (c && isFinite(c) && c > 0) { latestClose = c; break; }
+          }
+          const yPrice = latestClose || meta?.regularMarketPrice || 0;
+          if (yPrice > 0) {
+            // 使用 Yahoo 的 OHLC 數據填充
+            return {
+              symbol,
+              date: todayTW,
+              open:          meta?.regularMarketOpen ?? yPrice,
+              high:          meta?.regularMarketDayHigh ?? yPrice,
+              low:           meta?.regularMarketDayLow ?? yPrice,
+              close:         yPrice,
+              volume:        meta?.regularMarketVolume ?? parseInt(data?.v) ?? 0,
+              previousClose: prevClose || meta?.chartPreviousClose || yPrice,
+              change:        isMarketClosed ? 0 : yPrice - (prevClose || meta?.chartPreviousClose || yPrice),
+              changePercent: isMarketClosed ? 0 : (() => {
+                const pc = prevClose || meta?.chartPreviousClose || yPrice;
+                return pc > 0 ? ((yPrice - pc) / pc) * 100 : 0;
+              })(),
+              isMarketClosed,
+            };
+          }
+        } catch { continue; }
+      }
+      // 兩路都失敗才 fallback 昨收
+      closePrice = prevClose;
+    }
+
+    if (!data) return null;
+
     return {
       symbol,
-      date: new Date().toISOString().split('T')[0],
+      date: todayTW,
       open:          parseFloat(data.o) || closePrice,
       high:          parseFloat(data.h) || closePrice,
       low:           parseFloat(data.l) || closePrice,
@@ -366,18 +417,23 @@ function parseYahooChart(result: any, symbol: string, intraday: boolean): PriceD
 /**
  * 取得美股歷史資料 (Yahoo Finance，帶 User-Agent)
  * interval 支援：1m, 5m, 15m, 30m, 60m, 1d, 1wk
+ *
+ * 1m 特別說明：
+ *  - 使用 range=1d 取當日分鐘線，比 period1/period2 更可靠
+ *  - 期貨連續合約（GC=F 等）受 Yahoo 限制，1m 超過 1 天常回傳空資料
  */
 async function getUSHistoricalData(symbol: string, days: number, interval: string = '1d'): Promise<PriceData[]> {
-  // 1m 請求：Yahoo Finance 對期貨連續合約限制更嚴，超過 2 天容易回傳空資料
-  const effectiveDays = interval === '1m' ? Math.min(days, 2) : days;
   const endTime = Math.floor(Date.now() / 1000);
-  const startTime = endTime - (effectiveDays * 24 * 60 * 60);
+  const startTime = endTime - (Math.min(days, 60) * 24 * 60 * 60);
   const intraday = isIntradayInterval(interval);
 
   const effectiveSymbol = symbolAliases[symbol.toUpperCase()] ?? symbol;
   for (const sym of futuresCandidates(effectiveSymbol)) {
     try {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${startTime}&period2=${endTime}&interval=${interval}`;
+      // 1m 用 range=1d 更可靠（period1/period2 常對期貨回傳空資料）
+      const url = interval === '1m'
+        ? `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?range=1d&interval=1m`
+        : `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${startTime}&period2=${endTime}&interval=${interval}`;
       const response = await axios.get(url, { headers: yahooHeaders, timeout: 10000 });
 
       const result = response.data?.chart?.result?.[0];
@@ -393,16 +449,23 @@ async function getUSHistoricalData(symbol: string, days: number, interval: strin
 
 /**
  * 台股盤中資料（1m/5m 等）—— 透過 Yahoo Finance .TW / .TWO 後綴抓取
+ *
+ * 1m 特別說明：
+ *  - Yahoo Finance 的台股 1m 資料只提供「當日」
+ *  - 使用 range=1d&interval=1m 比 period1/period2 更可靠，可避免空回應
+ *  - 5m 以上保留 period1/period2 以取多日資料
  */
 async function getTWIntradayData(symbol: string, days: number, interval: string): Promise<PriceData[]> {
-  const effectiveDays = interval === '1m' ? Math.min(days, 2) : days;
   const endTime = Math.floor(Date.now() / 1000);
-  const startTime = endTime - (effectiveDays * 24 * 60 * 60);
+  const startTime = endTime - (Math.min(days, 60) * 24 * 60 * 60);
 
   for (const suffix of ['.TW', '.TWO']) {
     try {
       const sym = symbol + suffix;
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${startTime}&period2=${endTime}&interval=${interval}`;
+      // 1m 用 range=1d 取當日資料（比 period1/period2 更穩定）
+      const url = interval === '1m'
+        ? `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?range=1d&interval=1m`
+        : `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${startTime}&period2=${endTime}&interval=${interval}`;
       const response = await axios.get(url, { headers: yahooHeaders, timeout: 10000 });
       const result = response.data?.chart?.result?.[0];
       if (!result) continue;
