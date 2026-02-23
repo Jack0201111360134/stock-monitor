@@ -464,11 +464,56 @@ export interface NewsItem {
   publisher?: string;
 }
 
+// RSS 解析輔助（供 getStockNews 各來源共用）
+function parseNewsRss(xml: string, limit = 6): NewsItem[] {
+  const items: NewsItem[] = [];
+  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+  let m: RegExpExecArray | null;
+  while ((m = itemRegex.exec(xml)) !== null && items.length < limit) {
+    const block = m[1];
+    const title   = (/<title>([\s\S]*?)<\/title>/.exec(block)?.[1] ?? '').replace(/<!\[CDATA\[|\]\]>/g, '').trim();
+    const link    = (/<link>([\s\S]*?)<\/link>/.exec(block)?.[1] ?? '').trim();
+    const pubDate = (/<pubDate>([\s\S]*?)<\/pubDate>/.exec(block)?.[1] ?? '').trim();
+    const source  = (/<source[^>]*>([\s\S]*?)<\/source>/.exec(block)?.[1] ?? '').trim();
+    if (title && !title.startsWith('<')) {
+      items.push({
+        title,
+        url: link,
+        publisher: source || undefined,
+        publishTime: pubDate ? new Date(pubDate).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) : '',
+      });
+    }
+  }
+  return items;
+}
+
 export async function getStockNews(symbol: string, market: 'TW' | 'US'): Promise<NewsItem[]> {
   const ticker = market === 'TW' ? `${symbol}.TW` : symbol;
+  const rssHeaders = { 'User-Agent': yahooHeaders['User-Agent'], 'Accept': 'application/rss+xml, text/xml, */*' };
 
-  // ① Yahoo Finance v1 search（不加 enableEnhancedTrivialQuery，確保新聞與特定股票相關）
-  // quotesCount=1 讓 Yahoo 先辨識出正確的股票代號，再回傳對應新聞
+  // ① Yahoo Finance RSS（最貼近特定股票，代號直接對應）
+  try {
+    const region = market === 'TW' ? 'TW' : 'US';
+    const lang   = market === 'TW' ? 'zh-TW' : 'en-US';
+    const rssUrl = `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(ticker)}&region=${region}&lang=${lang}`;
+    const res = await axios.get(rssUrl, { headers: rssHeaders, timeout: 7000, responseType: 'text' });
+    const items = parseNewsRss(res.data ?? '');
+    if (items.length >= 2) return items;   // 至少 2 筆才算有效
+  } catch { /* 靜默 */ }
+
+  // ② Google News RSS（用股票代號 + 市場關鍵字搜尋，不同股票結果必然不同）
+  try {
+    const q    = market === 'TW' ? `${symbol} 台股` : `${symbol} stock`;
+    const hl   = market === 'TW' ? 'zh-TW' : 'en-US';
+    const gl   = market === 'TW' ? 'TW' : 'US';
+    const ceid = market === 'TW' ? 'TW:zh-Hant' : 'US:en';
+    const url  = `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
+    const res  = await axios.get(url, { headers: rssHeaders, timeout: 8000, responseType: 'text' });
+    const items = parseNewsRss(res.data ?? '');
+    if (items.length > 0) return items;
+  } catch { /* 靜默 */ }
+
+  // ③ Yahoo Finance search API（最後手段，可能回傳通用市場新聞）
   try {
     const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}&quotesCount=1&newsCount=8`;
     const res = await axios.get(url, { headers: yahooHeaders, timeout: 7000 });
@@ -485,39 +530,9 @@ export async function getStockNews(symbol: string, market: 'TW' | 'US'): Promise
         }))
         .filter((item: NewsItem) => item.title);
     }
-  } catch { /* fallback to RSS */ }
+  } catch { /* 靜默 */ }
 
-  // ② Fallback：Yahoo Finance RSS（依市場設定正確的 region/lang）
-  try {
-    const region = market === 'TW' ? 'TW' : 'US';
-    const lang   = market === 'TW' ? 'zh-TW' : 'en-US';
-    const rssUrl = `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(ticker)}&region=${region}&lang=${lang}`;
-    const res = await axios.get(rssUrl, {
-      headers: { 'User-Agent': yahooHeaders['User-Agent'] },
-      timeout: 6000,
-      responseType: 'text',
-    });
-    const xml: string = res.data ?? '';
-    const items: NewsItem[] = [];
-    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-    let m: RegExpExecArray | null;
-    while ((m = itemRegex.exec(xml)) !== null && items.length < 5) {
-      const block = m[1];
-      const title   = (/<title>([\s\S]*?)<\/title>/.exec(block)?.[1] ?? '').replace(/<!\[CDATA\[|\]\]>/g, '').trim();
-      const link    = (/<link>([\s\S]*?)<\/link>/.exec(block)?.[1] ?? '').trim();
-      const pubDate = (/<pubDate>([\s\S]*?)<\/pubDate>/.exec(block)?.[1] ?? '').trim();
-      if (title) {
-        items.push({
-          title,
-          url: link,
-          publishTime: pubDate ? new Date(pubDate).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) : '',
-        });
-      }
-    }
-    return items;
-  } catch {
-    return [];
-  }
+  return [];
 }
 
 // ─── 新聞摘要生成（多段落詳細版）────────────────────────────────

@@ -409,9 +409,9 @@ export default function StockDetail({ stock }: StockDetailProps) {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(true);
 
-  // 圖表控制
-  const [interval, setIntervalKey] = useState<IntervalKey>('1d');
-  const [chartType, setChartType] = useState<ChartType>('candle');
+  // 圖表控制（預設 1 分線，讓使用者看到即時盤中走勢）
+  const [interval, setIntervalKey] = useState<IntervalKey>('1m');
+  const [chartType, setChartType] = useState<ChartType>('line');
 
   useEffect(() => {
     loadQuoteAndSummary();

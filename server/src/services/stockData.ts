@@ -449,35 +449,71 @@ export async function getHistoricalData(
 /**
  * 取得三大法人買賣超 (台股)
  */
-export async function getInstitutionalTrades(date: string): Promise<any[]> {
-  try {
-    // 轉換日期格式為民國年
-    const [year, month, day] = date.split('-');
-    const rocYear = parseInt(year) - 1911;
-    const rocDate = `${rocYear}${month}${day}`;
+// TWSE 請求需帶 Referer，否則部分 API 會回傳空資料
+const twseHeaders = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Referer': 'https://www.twse.com.tw/',
+  'Accept': 'application/json, text/plain, */*',
+};
 
-    const url = `https://www.twse.com.tw/fund/T86?response=json&date=${rocDate}&selectType=ALL`;
-    const response = await axios.get(url);
-
-    if (!response.data?.data) {
-      return [];
-    }
-
-    return response.data.data.map((row: any[]) => ({
-      symbol: row[0],
-      name: row[1],
-      foreign_buy: parseFloat(row[2]?.replace(/,/g, '') || '0'),
-      foreign_sell: parseFloat(row[3]?.replace(/,/g, '') || '0'),
-      foreign_net: parseFloat(row[4]?.replace(/,/g, '') || '0'),
-      trust_buy: parseFloat(row[5]?.replace(/,/g, '') || '0'),
-      trust_sell: parseFloat(row[6]?.replace(/,/g, '') || '0'),
-      trust_net: parseFloat(row[7]?.replace(/,/g, '') || '0'),
-      dealer_buy: parseFloat(row[8]?.replace(/,/g, '') || '0'),
-      dealer_sell: parseFloat(row[9]?.replace(/,/g, '') || '0'),
-      dealer_net: parseFloat(row[10]?.replace(/,/g, '') || '0'),
-    }));
-  } catch (error) {
-    console.error('取得三大法人資料失敗:', error);
-    return [];
+function parseT86Row(row: any[]): {
+  symbol: string; name: string;
+  foreign_buy: number; foreign_sell: number; foreign_net: number;
+  trust_buy: number; trust_sell: number; trust_net: number;
+  dealer_buy: number; dealer_sell: number; dealer_net: number;
+} {
+  const n = (v: any) => parseFloat(String(v ?? '').replace(/,/g, '')) || 0;
+  // 新版 T86 欄位（共 19 欄）:
+  // [0]代號 [1]名稱
+  // [2-4]  外陸資(不含外資自營商) 買/賣/淨
+  // [5-7]  外資自營商             買/賣/淨
+  // [8-10] 投信                   買/賣/淨
+  // [11]   自營商 合計淨
+  // [12-14] 自營商(自行買賣)      買/賣/淨
+  // [15-17] 自營商(避險)          買/賣/淨
+  // [18]   三大法人合計淨
+  if (row.length >= 19) {
+    return {
+      symbol: row[0], name: row[1],
+      foreign_buy:  n(row[2])  + n(row[5]),  // 外陸資買 + 外資自營買
+      foreign_sell: n(row[3])  + n(row[6]),
+      foreign_net:  n(row[4])  + n(row[7]),  // 外資合計淨
+      trust_buy:    n(row[8]),
+      trust_sell:   n(row[9]),
+      trust_net:    n(row[10]),
+      dealer_buy:   n(row[12]) + n(row[15]),
+      dealer_sell:  n(row[13]) + n(row[16]),
+      dealer_net:   n(row[11]),               // 自營合計淨
+    };
   }
+  // 舊版格式（12 欄以下）向下相容
+  const n2 = (v: any) => parseFloat(String(v ?? '').replace(/,/g, '')) || 0;
+  return {
+    symbol: row[0], name: row[1],
+    foreign_buy: n2(row[2]), foreign_sell: n2(row[3]), foreign_net: n2(row[4]),
+    trust_buy:   n2(row[5]), trust_sell:   n2(row[6]), trust_net:   n2(row[7]),
+    dealer_buy:  n2(row[8]), dealer_sell:  n2(row[9]), dealer_net:  n2(row[10]),
+  };
+}
+
+export async function getInstitutionalTrades(date: string): Promise<any[]> {
+  // TWSE T86 使用西元年 YYYYMMDD 格式（不是民國年）
+  const adDate = date.replace(/-/g, '');  // "2026-02-11" → "20260211"
+
+  // 嘗試兩個 URL（新版 rwd 路徑 + 舊版 fund 路徑）
+  const urls = [
+    `https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date=${adDate}&selectType=ALL`,
+    `https://www.twse.com.tw/fund/T86?response=json&date=${adDate}&selectType=ALL`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const response = await axios.get(url, { headers: twseHeaders, timeout: 10000 });
+      if (response.data?.data?.length > 0) {
+        return response.data.data.map(parseT86Row);
+      }
+    } catch { /* 靜默，試下一個 URL */ }
+  }
+
+  return [];
 }
